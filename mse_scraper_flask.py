@@ -1,7 +1,9 @@
 import os.path
 from _pydatetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
+from xmlrpc.client import DateTime
 
+import numpy as np
 from bs4 import BeautifulSoup
 import requests
 import pandas as pd
@@ -15,6 +17,14 @@ from ta.volume import OnBalanceVolumeIndicator
 
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
+
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.callbacks import EarlyStopping
+
+from sklearn.preprocessing import MinMaxScaler
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 
 app = Flask(__name__)
 CORS(app)
@@ -161,8 +171,6 @@ def calculate_technical_indicators(df):
     indicators['RSI'] = RSIIndicator(df['Close'], window=14).rsi()
     indicators['OBV'] = OnBalanceVolumeIndicator(df['Close'], df['Volume']).on_balance_volume()
     indicators['Momentum'] = df['Close'].diff(periods=10)
-    # indicators['Stochastic'] = ((df['Close'] - df['Low'].rolling(window=14).min()) /
-    #                             (df['High'].rolling(window=14).max() - df['Low'].rolling(window=14).min())) * 100
 
     for name, values in indicators.items():
         df[name] = values
@@ -171,11 +179,75 @@ def calculate_technical_indicators(df):
 
     return df
 
-
 def generate_signals(df):
     df['Buy_Signal'] = (df['SMA_20'] > df['SMA_50']) & (df['RSI'] < 30)
     df['Sell_Signal'] = (df['SMA_20'] < df['SMA_50']) & (df['RSI'] > 70)
     return df
+
+# Function to create sequences for LSTM model
+def create_sequences(df, window=60):
+    features = ['Close', 'SMA_20', 'SMA_50', 'EMA_20', 'EMA_50', 'RSI', 'OBV', 'Momentum']
+    df = df[features].dropna()
+
+    if df.empty:
+        raise ValueError("The DataFrame is empty after dropping NaN values.")
+
+    print("Data types:\n", df.dtypes)
+    print("Data summary:\n", df.describe())
+
+    # Normalize the data
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    try:
+        scaled_data = scaler.fit_transform(df)
+    except ValueError as e:
+        print(f"Error during scaling: {e}")
+        print(df.head())
+        raise
+
+    X, y = [], []
+    for i in range(window, len(scaled_data)):
+        X.append(scaled_data[i - window:i])  # sequence of past prices
+        y.append(scaled_data[i, 0])  # next day's price (Close)
+
+    return np.array(X), np.array(y), scaler
+
+
+def build_lstm_model(input_shape):
+    model = Sequential()
+    model.add(LSTM(units=64, return_sequences=True, input_shape=input_shape))
+    model.add(Dropout(0.2))
+    model.add(LSTM(units=64, return_sequences=True))
+    model.add(Dropout(0.2))
+    model.add(LSTM(units=32, return_sequences=False))
+    model.add(Dropout(0.2))
+    model.add(Dense(units=16, activation='relu'))
+    model.add(Dense(units=1))
+    model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+    return model
+
+def train_lstm_model(df):
+    X, y, scaler = create_sequences(df)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, shuffle=False)
+
+    model = build_lstm_model(X_train.shape[1:])
+
+    early_stopping = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+
+    model.fit(X_train, y_train, epochs=100, batch_size=32, validation_data=(X_test, y_test), callbacks=[early_stopping])
+
+    return model, scaler, X_test, y_test
+
+
+def evaluate_and_predict(model, scaler, X_test, y_test):
+    predictions = model.predict(X_test)
+
+    predictions = scaler.inverse_transform(np.hstack((predictions, np.zeros((predictions.shape[0], X_test.shape[2]-1)))))[:,0]
+
+    rmse = np.sqrt(np.mean((predictions - y_test)**2))
+    print(f"Root Mean Squared Error: {rmse}")
+
+    return predictions
 
 
 def analyze_stock(file_path):
@@ -224,6 +296,7 @@ def analyze_stock(file_path):
     df.to_csv(output_file)
     print(f"Analysis completed for {file_path}, saved as {output_file}")
 
+
 def combine_data_and_analysis(code):
     data_file = f"data/data_frame_{code}.csv"
     analysis_file = f"data/data_frame_{code}_analysis.csv"
@@ -237,7 +310,6 @@ def combine_data_and_analysis(code):
         print(f"Analysis file for {code} not found.")
         return
 
-    # Load the original data and analysis data
     data_df = pd.read_csv(data_file)
     analysis_df = pd.read_csv(analysis_file)
 
@@ -251,26 +323,29 @@ def combine_data_and_analysis(code):
     data_df['Min'] = data_df['Min'].str.replace('.', '', regex=False).str.replace(',', '.').astype(float)
     data_df['Turnover in BEST in denars'] = data_df['Turnover in BEST in denars'].str.replace('.', '', regex=False).str.replace(',', '.').astype(float)
 
-    # Merge on 'Date' after ensuring consistent date format
     data_df['Date'] = pd.to_datetime(data_df['Date'])
     analysis_df['Date'] = pd.to_datetime(analysis_df['Date'])
 
     combined_df = pd.merge(data_df, analysis_df, on='Date', how='inner')
 
-    # Add 'Company Code' column if it doesn't already exist
     if 'Company Code' not in combined_df.columns:
         combined_df.insert(0, 'Company Code', code)
 
-    # Specify the desired column order
     column_order = [
-        'Company Code', 'Date', 'Price of last transaction (mkd)', 'Max', 'Min',
+        'Company Code', 'Date', 'Close', 'High', 'Low',
         'Average Price', '%change.', 'Quantity', 'Turnover in BEST in denars',
         'Total turnover in denars', 'SMA_20', 'SMA_50', 'EMA_20', 'EMA_50',
         'BB_Mid', 'RSI', 'OBV', 'Momentum', 'Buy_Signal', 'Sell_Signal'
     ]
 
-    # Reorder and save the combined DataFrame
     combined_df = combined_df[column_order]
+
+    combined_df.rename(columns={
+        'Close': 'Price of last transaction (mkd)',
+        'High': 'Max',
+        'Low': 'Min'
+    }, inplace=True)
+
     combined_df.to_csv(combined_file, index=False)
 
     print(f"Combined data and analysis saved as {combined_file}")
@@ -318,6 +393,76 @@ def get_issuer_data(issuer_code):
 def get_company_codes():
     codes = fetch_issuers_codes("https://www.mse.mk/mk/issuers/free-market", 'https://www.mse.mk/mk/stats/symbolhistory/')
     return jsonify(codes)
+
+@app.route("/api/update", methods=["GET"])
+def update_data():
+    main()
+    return "Data updated successfully", 200
+
+
+@app.route("/api/predict/<string:issuer_code>", methods=["GET"])
+def get_prediction(issuer_code):
+    # Read the historical data and the analysis data for the issuer
+    df = pd.read_csv(f"data/data_frame_{issuer_code}_analysis.csv")
+
+    # Train the LSTM model on the historical data
+    model, scaler, X_test, y_test = train_lstm_model(df)
+
+    # Evaluate the model and get predictions for the test set
+    predictions = evaluate_and_predict(model, scaler, X_test, y_test)
+
+    # Initialize the prediction column in the DataFrame
+    df['Predicted_Price'] = np.nan
+    df.iloc[-len(predictions):, df.columns.get_loc('Predicted_Price')] = predictions
+
+    # Get the last sequence of data to predict the next two days
+    last_sequence = df[['Close', 'SMA_20', 'SMA_50', 'EMA_20', 'EMA_50', 'RSI', 'OBV', 'Momentum']].iloc[-1:].copy()
+    last_sequence_scaled = scaler.transform(last_sequence)
+
+    # Predict the next day (Day 1)
+    next_day_1 = model.predict(
+        last_sequence_scaled.reshape(1, last_sequence_scaled.shape[0], last_sequence_scaled.shape[1]))
+    next_day_1 = scaler.inverse_transform(
+        np.hstack((next_day_1, np.zeros((next_day_1.shape[0], last_sequence_scaled.shape[1] - 1)))))[:, 0]
+
+    last_date = pd.to_datetime(df['Date'].iloc[-1])
+
+    # Add the prediction for the next day
+    next_day_1_predicted_df = pd.DataFrame({
+        'Date': [last_date + timedelta(days=1)],
+        'Predicted_Price': [next_day_1[0]],
+        'Buy_Signal': [np.nan],  # Optionally, you can add logic to generate a signal for the next day
+        'Sell_Signal': [np.nan]  # Optionally, you can add logic to generate a signal for the next day
+    })
+
+    # Now predict the second day based on the first prediction
+    # Append the predicted next day data and update the sequence
+    last_sequence.iloc[0, 0] = next_day_1[0]  # Update 'Close' for the next day
+    last_sequence_scaled = scaler.transform(last_sequence)
+
+    # Predict the second day (Day 2)
+    next_day_2 = model.predict(
+        last_sequence_scaled.reshape(1, last_sequence_scaled.shape[0], last_sequence_scaled.shape[1]))
+    next_day_2 = scaler.inverse_transform(
+        np.hstack((next_day_2, np.zeros((next_day_2.shape[0], last_sequence_scaled.shape[1] - 1)))))[:, 0]
+
+    # Add the prediction for the second next day
+    next_day_2_predicted_df = pd.DataFrame({
+        'Date': [last_date + timedelta(days=1)],
+        'Predicted_Price': [next_day_2[0]],
+        'Buy_Signal': [np.nan],  # Optionally, you can add logic to generate a signal for the second next day
+        'Sell_Signal': [np.nan]  # Optionally, you can add logic to generate a signal for the second next day
+    })
+
+    next_day_2_predicted_df['Date'] = next_day_2_predicted_df['Date'].dt.strftime('%Y-%m-%d')
+    next_day_1_predicted_df['Date'] = next_day_1_predicted_df['Date'].dt.strftime('%Y-%m-%d')
+
+
+    # Combine the historical data with the predictions for the next two days
+    predictions_df = pd.concat([df, next_day_1_predicted_df, next_day_2_predicted_df], ignore_index=True)
+
+    # Return the data as JSON
+    return predictions_df.to_json(orient="records")
 
 
 if __name__ == "__main__":
